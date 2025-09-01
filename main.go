@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,21 +13,21 @@ import (
 )
 
 func main() {
-	// Parse command line flags
 	listenAddr := flag.String("listen", "0.0.0.0:5672", "Address to listen on")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging")
 	flag.Parse()
 
-	// Configure logging
+	var llevel slog.Level
 	if *verbose {
-		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+		llevel = slog.LevelDebug
 	} else {
-		log.SetFlags(log.Ldate | log.Ltime)
+		llevel = slog.LevelInfo
 	}
 
-	log.Printf("Starting AMQP router on %s", *listenAddr)
-
-	p := proxy.NewServer(*listenAddr)
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: llevel,
+	}))
+	p := proxy.NewServer(*listenAddr, logger)
 
 	// Start the proxy in a goroutine
 	go func() {
@@ -35,16 +36,21 @@ func main() {
 		}
 	}()
 
-	// Handle graceful shutdown
+	// Handle a graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
-	fmt.Printf("Received signal %v, shutting down...\n", sig)
+	logger.Info("Received signal, shutting down", slog.Any("signal", sig))
 
 	// Stop the proxy
 	if err := p.Stop(); err != nil {
-		log.Fatalf("Error stopping proxy: %v", err)
+		fatal(logger, fmt.Errorf("error stopping router: %w", err))
 	}
 
-	log.Println("Router stopped successfully")
+	logger.Info("Router stopped")
+}
+
+func fatal(l *slog.Logger, err error) {
+	l.Error("Fatal error", slog.Any("error", err))
+	os.Exit(1)
 }

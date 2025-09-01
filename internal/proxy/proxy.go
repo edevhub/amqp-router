@@ -4,15 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/edevhub/amqp-router/internal/amqp091"
-	amqpconn "github.com/edevhub/amqp-router/internal/conn"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
+
+	"github.com/edevhub/amqp-router/internal/amqp091"
+	amqpconn "github.com/edevhub/amqp-router/internal/conn"
 )
 
 type Server struct {
-	addr string
+	addr   string
+	logger *slog.Logger
 
 	listener net.Listener
 	conns    map[net.Conn]struct{}
@@ -22,10 +24,11 @@ type Server struct {
 	mu       sync.Mutex
 }
 
-func NewServer(addr string) *Server {
+func NewServer(addr string, logger *slog.Logger) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		addr:   addr,
+		logger: logger,
 		ctx:    ctx,
 		cancel: cancel,
 		conns:  make(map[net.Conn]struct{}),
@@ -39,8 +42,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to start listener on %s: %w", s.addr, err)
 	}
-
-	log.Printf("Listening on %s", s.addr)
+	s.logger.Info(fmt.Sprintf("Listening on %s", s.addr))
 
 	s.wg.Add(1)
 	go s.acceptLoop()
@@ -60,7 +62,14 @@ func (s *Server) Stop() error {
 
 	s.mu.Lock()
 	for conn := range s.conns {
-		conn.Close()
+		l := s.logger.With(
+			slog.String("remote", conn.RemoteAddr().String()),
+			slog.String("local", conn.LocalAddr().String()),
+		)
+		l.Debug("Closing connection")
+		if err := conn.Close(); err != nil {
+			l.Error("Error closing connection")
+		}
 	}
 	s.mu.Unlock()
 
@@ -71,6 +80,7 @@ func (s *Server) Stop() error {
 
 // acceptLoop accepts incoming connections and handles them
 func (s *Server) acceptLoop() {
+	// closes external group added in the Start() method
 	defer s.wg.Done()
 
 	for {
@@ -80,7 +90,7 @@ func (s *Server) acceptLoop() {
 			case <-s.ctx.Done():
 				return
 			default:
-				log.Printf("Error accepting connection: %v", err)
+				s.logger.Error("Failed to accept new connection", slog.Any("error", err))
 				continue
 			}
 		}
@@ -100,7 +110,7 @@ func (s *Server) acceptLoop() {
 
 			if err = s.handleConnection(c); err != nil {
 				if !errors.Is(err, net.ErrClosed) {
-					log.Printf("Error handling connection: %v", err)
+					s.logger.Error("Error handling connection", slog.Any("error", err))
 				}
 			}
 		}(conn)
@@ -115,7 +125,7 @@ func (s *Server) handleConnection(conn net.Conn) error {
 	// Handle the connection with AMQP-specific logic
 	errCh := make(chan error, 1)
 	go func() {
-		err := handleAMQPConnection(amqpconn.NewConnection(conn))
+		err := s.handleAMQPConnection(amqpconn.NewConnection(conn, s.logger.WithGroup("amqp")))
 		errCh <- err
 	}()
 
@@ -127,8 +137,16 @@ func (s *Server) handleConnection(conn net.Conn) error {
 	}
 }
 
-func handleAMQPConnection(conn *amqpconn.Connection) error {
-	defer conn.Close()
+func (s *Server) handleAMQPConnection(conn *amqpconn.Connection) error {
+	l := s.logger.With(
+		slog.String("remote", conn.RemoteAddr().String()),
+		slog.String("local", conn.LocalAddr().String()),
+	)
+	defer func() {
+		if err := conn.Close(); err != nil {
+			l.Error("Error closing AMQP connection", slog.Any("error", err))
+		}
+	}()
 
 	pkgs, err := conn.Init()
 	if err != nil {
@@ -139,7 +157,7 @@ func handleAMQPConnection(conn *amqpconn.Connection) error {
 	if p.Err != nil {
 		return fmt.Errorf("failed to read AMQP RPC frame: %w", err)
 	}
-	log.Printf("Received AMQP RPC frame: %+v", p.Frame.(*amqp091.MethodFrame).Method)
-	log.Printf("AMQP connection stable. Aborting.")
+	l.Debug("Received AMQP RPC frame", slog.Any("method", fmt.Sprintf("%T", p.Frame.(*amqp091.MethodFrame).Method)))
+	l.Debug("AMQP connection stable. Aborting.")
 	return nil
 }
