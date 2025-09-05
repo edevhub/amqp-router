@@ -6,6 +6,7 @@
 package amqp091
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"time"
@@ -411,6 +412,13 @@ type reader struct {
 
 type writer struct {
 	w io.Writer
+}
+
+func (w *writer) Flush() error {
+	if buf, ok := w.w.(*bufio.Writer); ok {
+		return buf.Flush()
+	}
+	return nil
 }
 
 // Implements the frame interface for Connection RPC

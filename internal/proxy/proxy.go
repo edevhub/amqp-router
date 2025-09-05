@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/edevhub/amqp-router/internal/amqp091"
-	amqpconn "github.com/edevhub/amqp-router/internal/conn"
 )
 
 type Server struct {
@@ -112,6 +111,7 @@ func (s *Server) acceptLoop() {
 				if !errors.Is(err, net.ErrClosed) {
 					s.logger.Error("Error handling connection", slog.Any("error", err))
 				}
+				s.logger.Error("Error handling AMQP connection", slog.Any("error", err))
 			}
 		}(conn)
 	}
@@ -119,45 +119,29 @@ func (s *Server) acceptLoop() {
 
 // handleConnection processes a client connection
 func (s *Server) handleConnection(conn net.Conn) error {
-	ctx, cancel := context.WithCancel(s.ctx)
-	defer cancel()
-
-	// Handle the connection with AMQP-specific logic
-	errCh := make(chan error, 1)
-	go func() {
-		err := s.handleAMQPConnection(amqpconn.NewConnection(conn, s.logger.WithGroup("amqp")))
-		errCh <- err
-	}()
-
-	select {
-	case err := <-errCh:
+	amqpConn := amqp091.NewConnection(conn, s.logger.WithGroup("amqp"))
+	pkgs, err := amqpConn.Handle(s.ctx)
+	if err != nil {
 		return err
-	case <-ctx.Done():
-		return nil
 	}
-}
-
-func (s *Server) handleAMQPConnection(conn *amqpconn.Connection) error {
-	l := s.logger.With(
-		slog.String("remote", conn.RemoteAddr().String()),
-		slog.String("local", conn.LocalAddr().String()),
-	)
 	defer func() {
-		if err := conn.Close(); err != nil {
-			l.Error("Error closing AMQP connection", slog.Any("error", err))
+		if cerr := amqpConn.Close(); cerr != nil {
+			s.logger.Warn("Error closing AMQP connection", slog.Any("error", cerr))
 		}
 	}()
-
-	pkgs, err := conn.Init()
-	if err != nil {
-		return fmt.Errorf("failed to init AMQP connection: %w", err)
+	for pkg := range pkgs {
+		if pkg == nil {
+			return nil
+		}
+		if pkg.Err != nil {
+			return pkg.Err
+		}
+		s.logger.Debug("Received AMQP package", slog.Any("package", pkg))
+		select {
+		case <-s.ctx.Done():
+			return nil
+		default:
+		}
 	}
-
-	p := <-pkgs
-	if p.Err != nil {
-		return fmt.Errorf("failed to read AMQP RPC frame: %w", err)
-	}
-	l.Debug("Received AMQP RPC frame", slog.Any("method", fmt.Sprintf("%T", p.Frame.(*amqp091.MethodFrame).Method)))
-	l.Debug("AMQP connection stable. Aborting.")
 	return nil
 }
