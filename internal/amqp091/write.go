@@ -58,7 +58,7 @@ func (f *methodFrame) write(w io.Writer) (err error) {
 
 // Heartbeat
 //
-// Payload is empty
+// Message is empty
 func (f *heartbeatFrame) write(w io.Writer) (err error) {
 	return writeFrame(w, frameHeartbeat, f.ChannelId, []byte{})
 }
@@ -205,7 +205,7 @@ func (f *headerFrame) write(w io.Writer) (err error) {
 
 // Body
 //
-// Payload is one byterange from the full body who's size is declared in the
+// Message is one byterange from the full body who's size is declared in the
 // Header frame
 func (f *bodyFrame) write(w io.Writer) (err error) {
 	return writeFrame(w, frameBody, f.ChannelId, f.Body)

@@ -2,17 +2,22 @@ package amqp091
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/edevhub/amqp-router/internal/transport"
 )
 
 type Mapper struct {
-	channels map[uint16]*transport.Channel
+	logger         *slog.Logger
+	channels       map[uint16]*transport.Channel
+	channelsNotify chan *transport.Channel
 }
 
-func NewMapper() *Mapper {
+func NewMapper(logger *slog.Logger) *Mapper {
 	return &Mapper{
-		channels: make(map[uint16]*transport.Channel),
+		logger:         logger,
+		channels:       make(map[uint16]*transport.Channel),
+		channelsNotify: make(chan *transport.Channel),
 	}
 }
 
@@ -28,16 +33,26 @@ func (m *Mapper) MapFrame(f frame, emit chan<- *transport.Package) error {
 }
 
 func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) error {
+	m.logger.Debug("Received method", slog.Any("method", f.Method), "channel", f.ChannelId, "method_id", f.MethodId, "class_id", f.ClassId)
 	switch method := f.Method.(type) {
 	case *channelOpen:
 		id := f.channel()
-		ch := &transport.Channel{ID: id}
+		ch := transport.OpenChannel(id)
 		m.channels[id] = ch
-		emit <- &transport.Package{Payload: ch}
+		go func() {
+			m.channelsNotify <- ch
+		}()
+		ch.Reply(&transport.Package{Message: &transport.Reply{Code: transport.ReplyCodeChannelOpenOk}})
 		return nil
 	default:
 		return fmt.Errorf("unsupported method: %T", method)
 	}
 }
 
-func (m *Mapper) Cleanup() {}
+func (m *Mapper) NotifyNewChannel() <-chan *transport.Channel {
+	return m.channelsNotify
+}
+
+func (m *Mapper) Cleanup() {
+	close(m.channelsNotify)
+}

@@ -50,7 +50,8 @@ func (c *Connection) Handle(ctx context.Context) (<-chan *transport.Package, err
 	}
 
 	out := make(chan *transport.Package)
-	mapper := NewMapper()
+	mapper := NewMapper(c.logger)
+	go c.handleReplies(ctx, mapper.NotifyNewChannel())
 	go func() {
 		defer close(out)
 		defer mapper.Cleanup()
@@ -145,7 +146,7 @@ func (c *Connection) openConnection() error {
 
 	// TODO: handle defaults
 	ftune := &connectionTune{
-		ChannelMax: 8,
+		ChannelMax: 32,
 		FrameMax:   131072,
 		Heartbeat:  300,
 	}
@@ -164,7 +165,7 @@ func (c *Connection) openConnection() error {
 	return nil
 }
 
-// TODO: refactor to get rid of reflection
+// TODO: refactor to get rid of reflection (maybe replace with switch)
 func (c *Connection) call(req message, expect ...message) error {
 	// req is nil if we don't need to send a request, but we still need to read incoming frames
 	if req != nil {
@@ -190,5 +191,50 @@ func (c *Connection) call(req message, expect ...message) error {
 		vres.Set(vmsg)
 	}
 
+	return nil
+}
+
+func (c *Connection) handleReplies(ctx context.Context, notify <-chan *transport.Channel) {
+	for {
+		select {
+		case <-ctx.Done():
+			c.logger.Debug("Context cancelled, stop handling new reply channels")
+			return
+		case ch := <-notify:
+			c.listenReplies(ctx, ch)
+		}
+	}
+}
+
+func (c *Connection) listenReplies(ctx context.Context, ch *transport.Channel) {
+	for {
+		select {
+		case <-ctx.Done():
+			c.logger.Debug("Context cancelled, stop listening for replies on channel", slog.Int("channel", int(ch.ID)))
+			return
+		case p := <-ch.Receive():
+			c.logger.Debug("Received reply", slog.Any("reply", p))
+			switch m := p.Message.(type) {
+			case *transport.Reply:
+				c.logger.Debug("Sending reply message", slog.Any("reply", m))
+				if err := c.sendReplyMessage(ch, m); err != nil {
+					c.logger.Error("Failed to send reply message", slog.Any("error", err), slog.Any("reply", m))
+				}
+			}
+		}
+	}
+}
+
+func (c *Connection) sendReplyMessage(ch *transport.Channel, m *transport.Reply) error {
+	switch m.Code {
+	case transport.ReplyCodeChannelOpenOk:
+		c.logger.Debug("Sending channel open ok reply")
+		return c.send(&methodFrame{
+			ChannelId: ch.ID,
+			Method:    &channelOpenOk{},
+		})
+	default:
+		c.logger.Debug("cannot handle reply message", slog.Any("reply_code", m.Code))
+	}
 	return nil
 }

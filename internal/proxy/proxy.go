@@ -9,34 +9,48 @@ import (
 	"sync"
 
 	"github.com/edevhub/amqp-router/internal/amqp091"
+	"github.com/edevhub/amqp-router/internal/backend"
+	"github.com/edevhub/amqp-router/internal/transport"
 )
 
 type Server struct {
 	addr   string
 	logger *slog.Logger
 
-	listener net.Listener
-	conns    map[net.Conn]struct{}
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	mu       sync.Mutex
+	listener  net.Listener
+	conns     map[net.Conn]struct{}
+	backends  *backend.Pool
+	transport chan *transport.Package
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	mu     sync.Mutex
 }
 
-func NewServer(addr string, logger *slog.Logger) *Server {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewServer(ctx context.Context, addr string, backends *backend.Pool, logger *slog.Logger) *Server {
+	ctx, cancel := context.WithCancel(ctx)
 	return &Server{
-		addr:   addr,
-		logger: logger,
-		ctx:    ctx,
-		cancel: cancel,
-		conns:  make(map[net.Conn]struct{}),
+		addr:     addr,
+		logger:   logger,
+		ctx:      ctx,
+		cancel:   cancel,
+		conns:    make(map[net.Conn]struct{}),
+		backends: backends,
 	}
 }
 
 // Start begins listening for connections and proxying them to the upstream server
 func (s *Server) Start() error {
 	var err error
+
+	s.transport = make(chan *transport.Package)
+	back, err := s.backends.GetDefault()
+	if err != nil {
+		return fmt.Errorf("failed to connect to the default backend: %w", err)
+	}
+	go s.connectBackend(back)
+
 	s.listener, err = net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("failed to start listener on %s: %w", s.addr, err)
@@ -74,6 +88,8 @@ func (s *Server) Stop() error {
 
 	// Wait for all goroutines to finish
 	s.wg.Wait()
+	close(s.transport)
+	s.backends.Close()
 	return nil
 }
 
@@ -141,7 +157,15 @@ func (s *Server) handleConnection(conn net.Conn) error {
 		case <-s.ctx.Done():
 			return nil
 		default:
+			s.logger.Debug("Sending package to the default backend", slog.Any("package", pkg))
+			s.transport <- pkg
 		}
 	}
 	return nil
+}
+
+func (s *Server) connectBackend(back *backend.AMQP091) {
+	if err := back.Connect(s.ctx, s.transport); err != nil {
+		s.logger.Error("Connection to the default backend failed", slog.Any("error", err))
+	}
 }

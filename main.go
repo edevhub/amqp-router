@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -9,11 +10,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/edevhub/amqp-router/internal/backend"
 	"github.com/edevhub/amqp-router/internal/proxy"
 )
 
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:5672", "Address to listen on")
+	backendDsn := flag.String("backend", "amqp://guest:guest@localhost:5673/", "Backend AMQP URI")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging")
 	flag.Parse()
 
@@ -27,7 +30,8 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
 		Level: llevel,
 	}))
-	p := proxy.NewServer(*listenAddr, logger)
+	backends := backend.NewPool(map[string]*backend.AMQP091Config{backend.Default: {DSN: *backendDsn}}, logger)
+	p := proxy.NewServer(context.Background(), *listenAddr, backends, logger)
 
 	// Start the proxy in a goroutine
 	go func() {
@@ -36,7 +40,7 @@ func main() {
 		}
 	}()
 
-	// Handle a graceful shutdown
+	// Connect a graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
