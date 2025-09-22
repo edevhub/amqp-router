@@ -18,6 +18,7 @@ type (
 		w      *writer
 		r      *reader
 		conn   net.Conn
+		mapper *Mapper
 		logger *slog.Logger
 
 		sendMx sync.Mutex
@@ -29,6 +30,7 @@ func NewConnection(c net.Conn, l *slog.Logger) *Connection {
 		w:      &writer{w: c},
 		r:      &reader{r: c},
 		conn:   c,
+		mapper: NewMapper(l),
 		logger: l,
 	}
 }
@@ -50,11 +52,10 @@ func (c *Connection) Handle(ctx context.Context) (<-chan *transport.Package, err
 	}
 
 	out := make(chan *transport.Package)
-	mapper := NewMapper(c.logger)
-	go c.handleReplies(ctx, mapper.NotifyNewChannel())
+	go c.handleReplies(ctx, c.mapper.NotifyNewSession())
 	go func() {
 		defer close(out)
-		defer mapper.Cleanup()
+		defer c.mapper.Cleanup()
 		for {
 			select {
 			case <-ctx.Done():
@@ -69,7 +70,7 @@ func (c *Connection) Handle(ctx context.Context) (<-chan *transport.Package, err
 					out <- &transport.Package{Err: err}
 					return
 				}
-				if err = mapper.MapFrame(f, out); err != nil {
+				if err = c.mapper.MapFrame(f, out); err != nil {
 					c.logger.Error("Failed to map frame", slog.Any("error", err), slog.Any("frame", f))
 					out <- &transport.Package{Err: fmt.Errorf("unexpected frame: %w", err)}
 					return
@@ -138,7 +139,7 @@ func (c *Connection) openConnection() error {
 	}
 	fstartOk := &connectionStartOk{}
 	c.logger.Debug("Sending AMQP connection start")
-	if err := c.call(fstart, fstartOk); err != nil {
+	if err := c.callMethod(&methodFrame{ChannelId: 0, Method: fstart}, fstartOk); err != nil {
 		return fmt.Errorf("Connection.Start sequence failure: %w", err)
 	}
 
@@ -153,27 +154,20 @@ func (c *Connection) openConnection() error {
 	ftuneOk := &connectionTuneOk{}
 	fopen := &connectionOpen{}
 	c.logger.Debug("Sending AMQP connection tune")
-	if err := c.call(ftune, ftuneOk, fopen); err != nil {
+	if err := c.callMethod(&methodFrame{ChannelId: 0, Method: ftune}, ftuneOk, fopen); err != nil {
 		return fmt.Errorf("Connection.Tune sequence failure: %w", err)
 	}
 
 	fopenOk := &connectionOpenOk{}
 	c.logger.Debug("Sending AMQP connection open")
-	if err := c.call(fopenOk); err != nil {
+	if err := c.callMethod(&methodFrame{ChannelId: 0, Method: fopenOk}); err != nil {
 		return fmt.Errorf("Connection.Open sequence failure: %w", err)
 	}
 	return nil
 }
 
 // TODO: refactor to get rid of reflection (maybe replace with switch)
-func (c *Connection) call(req message, expect ...message) error {
-	// req is nil if we don't need to send a request, but we still need to read incoming frames
-	if req != nil {
-		if err := c.send(&methodFrame{ChannelId: 0, Method: req}); err != nil {
-			return err
-		}
-	}
-
+func (c *Connection) expectMethodReply(expect ...message) error {
 	for _, try := range expect {
 		f, err := c.r.ReadFrame()
 		if err != nil {
@@ -190,29 +184,42 @@ func (c *Connection) call(req message, expect ...message) error {
 		vmsg := reflect.ValueOf(mf.Method).Elem()
 		vres.Set(vmsg)
 	}
-
 	return nil
 }
 
-func (c *Connection) handleReplies(ctx context.Context, notify <-chan *transport.Channel) {
+func (c *Connection) callMethod(req frame, expect ...message) error {
+	// req is nil if we don't need to send a request, but we still need to read incoming frames
+	if req != nil {
+		if err := c.send(req); err != nil {
+			return err
+		}
+	}
+
+	return c.expectMethodReply(expect...)
+}
+
+func (c *Connection) handleReplies(ctx context.Context, notify <-chan *transport.Session) {
 	for {
 		select {
 		case <-ctx.Done():
-			c.logger.Debug("Context cancelled, stop handling new reply channels")
+			c.logger.Debug("Context cancelled, stop handling new reply sessions")
 			return
 		case ch := <-notify:
-			c.listenReplies(ctx, ch)
+			go c.listenReplies(ctx, ch)
 		}
 	}
 }
 
-func (c *Connection) listenReplies(ctx context.Context, ch *transport.Channel) {
+func (c *Connection) listenReplies(ctx context.Context, ch *transport.Session) {
 	for {
 		select {
 		case <-ctx.Done():
 			c.logger.Debug("Context cancelled, stop listening for replies on channel", slog.Int("channel", int(ch.ID)))
 			return
-		case p := <-ch.Receive():
+		case p, open := <-ch.Receive():
+			if !open {
+				return
+			}
 			c.logger.Debug("Received reply", slog.Any("reply", p))
 			switch m := p.Message.(type) {
 			case *transport.Reply:
@@ -220,18 +227,35 @@ func (c *Connection) listenReplies(ctx context.Context, ch *transport.Channel) {
 				if err := c.sendReplyMessage(ch, m); err != nil {
 					c.logger.Error("Failed to send reply message", slog.Any("error", err), slog.Any("reply", m))
 				}
+			case *transport.ReplyError:
+				c.logger.Error("Received reply error", slog.Any("reply", m))
+				req := &methodFrame{ChannelId: ch.ID, Method: &channelClose{
+					ReplyCode: 504, // generic channel error
+					ReplyText: m.Err.Error(),
+				}}
+				if err := c.callMethod(req, &channelCloseOk{}); err != nil {
+					// TODO: Maybe close connection completely here?
+					c.logger.Error("failed to confirm channel close", slog.Any("error", err), slog.Any("reply", m))
+				}
+				c.mapper.RecycleSession(ch.SID())
 			}
 		}
 	}
 }
 
-func (c *Connection) sendReplyMessage(ch *transport.Channel, m *transport.Reply) error {
+func (c *Connection) sendReplyMessage(ch *transport.Session, m *transport.Reply) error {
 	switch m.Code {
 	case transport.ReplyCodeChannelOpenOk:
 		c.logger.Debug("Sending channel open ok reply")
 		return c.send(&methodFrame{
 			ChannelId: ch.ID,
 			Method:    &channelOpenOk{},
+		})
+	case transport.ReplyCodeExchangeDeclareOk:
+		c.logger.Debug("Sending exchange declare ok reply")
+		return c.send(&methodFrame{
+			ChannelId: ch.ID,
+			Method:    &exchangeDeclareOk{},
 		})
 	default:
 		c.logger.Debug("cannot handle reply message", slog.Any("reply_code", m.Code))

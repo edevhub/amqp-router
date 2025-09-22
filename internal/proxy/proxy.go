@@ -150,6 +150,7 @@ func (s *Server) handleConnection(conn net.Conn) error {
 			return nil
 		}
 		if pkg.Err != nil {
+			// TODO: Handle mapping errors and send back to client instead of dropping the connection
 			return pkg.Err
 		}
 		s.logger.Debug("Received AMQP package", slog.Any("package", pkg))
