@@ -243,22 +243,60 @@ func (c *Connection) listenReplies(ctx context.Context, ch *transport.Session) {
 	}
 }
 
-func (c *Connection) sendReplyMessage(ch *transport.Session, m *transport.Reply) error {
+func (c *Connection) sendReplyMessage(sess *transport.Session, m *transport.Reply) error {
 	switch m.Code {
 	case transport.ReplyCodeChannelOpenOk:
 		c.logger.Debug("Sending channel open ok reply")
 		return c.send(&methodFrame{
-			ChannelId: ch.ID,
+			ChannelId: sess.ID,
 			Method:    &channelOpenOk{},
 		})
 	case transport.ReplyCodeExchangeDeclareOk:
 		c.logger.Debug("Sending exchange declare ok reply")
 		return c.send(&methodFrame{
-			ChannelId: ch.ID,
+			ChannelId: sess.ID,
 			Method:    &exchangeDeclareOk{},
 		})
+	case transport.ReplyCodeQueueDeclareOk:
+		c.logger.Debug("Sending queue declare ok reply")
+		return c.send(&methodFrame{
+			ChannelId: sess.ID,
+			Method:    &queueDeclareOk{},
+		})
+	case transport.ReplyCodeQueueBindOk:
+		c.logger.Debug("Sending queue bind ok reply")
+		return c.send(&methodFrame{
+			ChannelId: sess.ID,
+			Method:    &queueBindOk{},
+		})
+	case transport.ReplyCodeBasicAck:
+		c.logger.Debug("Sending basic publish ok reply")
+		confirm, ok := m.Content.(*transport.ReplyConfirmation)
+		if !ok {
+			c.logger.Error("Unexpected reply content type",
+				slog.Int("reply_code", int(m.Code)),
+				slog.String("content_type", fmt.Sprintf("%T", m.Content)),
+				slog.Any("content", m.Content),
+			)
+		}
+		if confirm.Ack {
+			return c.send(&methodFrame{
+				ChannelId: sess.ID,
+				Method: &basicAck{
+					DeliveryTag: confirm.DeliveryTag,
+					Multiple:    confirm.Multiple,
+				},
+			})
+		}
+		return c.send(&methodFrame{
+			ChannelId: sess.ID,
+			Method: &basicNack{
+				DeliveryTag: confirm.DeliveryTag,
+				Multiple:    confirm.Multiple,
+			},
+		})
 	default:
-		c.logger.Debug("cannot handle reply message", slog.Any("reply_code", m.Code))
+		c.logger.Debug("Cannot handle reply message", slog.Any("reply_code", m.Code))
 	}
 	return nil
 }

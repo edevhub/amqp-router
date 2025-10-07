@@ -39,7 +39,13 @@ func (m *Mapper) MapFrame(f frame, emit chan<- *transport.Package) error {
 }
 
 func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) error {
-	m.logger.Debug("Received method", slog.Any("method", f.Method), "channel", f.ChannelId, "method_id", f.MethodId, "class_id", f.ClassId)
+	m.logger.Debug("Received method",
+		slog.String("method_type", fmt.Sprintf("%T", f.Method)),
+		slog.Any("method_attrs", f.Method),
+		"channel", f.ChannelId,
+		"method_id", f.MethodId,
+		"class_id", f.ClassId,
+	)
 	switch method := f.Method.(type) {
 	case *channelOpen:
 		id := f.channel()
@@ -54,26 +60,90 @@ func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) er
 		ch.Reply(&transport.Package{Message: &transport.Reply{Code: transport.ReplyCodeChannelOpenOk}})
 		return nil
 	case *exchangeDeclare:
-		id := f.channel()
-		m.mx.Lock()
-		ch, found := m.sessions[id]
-		m.mx.Unlock()
-		if !found {
-			return fmt.Errorf("unknown channel: %d", id)
+		sess, err := m.findSession(f.channel())
+		if err != nil {
+			return err
 		}
-		emit <- &transport.Package{Session: ch, Message: &transport.DeclareExchange{
+		emit <- &transport.Package{Session: sess, Message: &transport.DeclareExchange{
 			Name:       method.Exchange,
 			Type:       method.Type,
 			Durable:    method.Durable,
 			AutoDelete: method.AutoDelete,
 			Internal:   method.Internal,
 			NoWait:     method.NoWait,
-			Arguments:  method.Arguments,
+			Arguments:  transport.Arguments(method.Arguments),
+		}}
+		return nil
+	case *queueDeclare:
+		sess, err := m.findSession(f.channel())
+		if err != nil {
+			return err
+		}
+		emit <- &transport.Package{Session: sess, Message: &transport.DeclareQueue{
+			Name:       method.Queue,
+			Passive:    method.Passive,
+			Durable:    method.Exclusive,
+			Exclusive:  method.Exclusive,
+			AutoDelete: method.AutoDelete,
+			NoWait:     method.NoWait,
+			Arguments:  transport.Arguments(method.Arguments),
+		}}
+		return nil
+	case *queueBind:
+		sess, err := m.findSession(f.channel())
+		if err != nil {
+			return err
+		}
+		emit <- &transport.Package{Session: sess, Message: &transport.BindQueue{
+			Queue:      method.Queue,
+			Exchange:   method.Exchange,
+			RoutingKey: method.RoutingKey,
+			NoWait:     method.NoWait,
+			Arguments:  transport.Arguments(method.Arguments),
+		}}
+		return nil
+	case *basicPublish:
+		sess, err := m.findSession(f.channel())
+		if err != nil {
+			return err
+		}
+		// TODO: debug why messages are received and mapped empty
+		emit <- &transport.Package{Session: sess, Message: &transport.BasicPublish{
+			Exchange:   method.Exchange,
+			RoutingKey: method.RoutingKey,
+			Mandatory:  method.Mandatory,
+			Immediate:  method.Immediate,
+			Properties: transport.DeliveryProps{
+				ContentType:     method.Properties.ContentType,
+				ContentEncoding: method.Properties.ContentEncoding,
+				Headers:         transport.Arguments(method.Properties.Headers),
+				DeliveryMode:    method.Properties.DeliveryMode,
+				Priority:        method.Properties.Priority,
+				CorrelationId:   method.Properties.CorrelationId,
+				ReplyTo:         method.Properties.ReplyTo,
+				Expiration:      method.Properties.Expiration,
+				MessageId:       method.Properties.MessageId,
+				Timestamp:       method.Properties.Timestamp,
+				Type:            method.Properties.Type,
+				UserId:          method.Properties.UserId,
+				AppId:           method.Properties.AppId,
+			},
+			Body: method.Body,
 		}}
 		return nil
 	default:
 		return fmt.Errorf("unsupported method: %T", method)
 	}
+}
+
+func (m *Mapper) findSession(id uint16) (*transport.Session, error) {
+	m.mx.Lock()
+	sess, found := m.sessions[id]
+	m.mx.Unlock()
+	if !found {
+		return nil, fmt.Errorf("unknown channel: %d", id)
+	}
+	return sess, nil
 }
 
 func (m *Mapper) NotifyNewSession() <-chan *transport.Session {
