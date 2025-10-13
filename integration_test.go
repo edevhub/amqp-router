@@ -17,7 +17,7 @@ func amqpURI() string {
 	if v := os.Getenv("AMQP_URI"); v != "" {
 		return v
 	}
-	return "amqp://guest:guest@localhost:5673/"
+	return "amqp://guest:guest@localhost:5672/"
 }
 
 // tryConnect attempts to connect with short timeout; returns connection or nil with error.

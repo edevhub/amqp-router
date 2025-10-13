@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 
@@ -53,7 +54,7 @@ func (b *AMQP091) handlePackage(ctx context.Context, p *transport.Package) {
 	}
 	switch m := p.Message.(type) {
 	case *transport.DeclareExchange:
-		if err = ch.ExchangeDeclare(m.Name, m.Type, m.Durable, m.AutoDelete, m.Internal, m.NoWait, amqpgo.Table(m.Arguments)); err != nil {
+		if err = ch.ExchangeDeclare(m.Name, m.Type, m.Durable, m.AutoDelete, m.Internal, m.NoWait, castArgumentsToAMQP091Table(m.Arguments)); err != nil {
 			p.Session.Reply(&transport.Package{Message: &transport.ReplyError{Err: err}})
 			return
 		}
@@ -63,18 +64,23 @@ func (b *AMQP091) handlePackage(ctx context.Context, p *transport.Package) {
 		if m.Passive {
 			declare = ch.QueueDeclarePassive
 		}
-		if _, err = declare(m.Name, m.Durable, m.AutoDelete, m.Exclusive, m.NoWait, amqpgo.Table(m.Arguments)); err != nil {
+		if _, err = declare(m.Name, m.Durable, m.AutoDelete, m.Exclusive, m.NoWait, castArgumentsToAMQP091Table(m.Arguments)); err != nil {
 			p.Session.Reply(&transport.Package{Message: &transport.ReplyError{Err: err}})
 		}
 		p.Session.Reply(&transport.Package{Message: &transport.Reply{Code: transport.ReplyCodeQueueDeclareOk}})
 	case *transport.BindQueue:
-		if err = ch.QueueBind(m.Queue, m.RoutingKey, m.Exchange, m.NoWait, amqpgo.Table(m.Arguments)); err != nil {
+		if err = ch.QueueBind(m.Queue, m.RoutingKey, m.Exchange, m.NoWait, castArgumentsToAMQP091Table(m.Arguments)); err != nil {
 			p.Session.Reply(&transport.Package{Message: &transport.ReplyError{Err: err}})
 		}
 		p.Session.Reply(&transport.Package{Message: &transport.Reply{Code: transport.ReplyCodeQueueBindOk}})
 	case *transport.BasicPublish:
+		body, err := io.ReadAll(m.Body)
+		if err != nil {
+			p.Session.Reply(&transport.Package{Message: &transport.ReplyError{Err: err}})
+			return
+		}
 		confirm, err := ch.PublishWithDeferredConfirmWithContext(ctx, m.Exchange, m.RoutingKey, m.Mandatory, m.Immediate, amqpgo.Publishing{
-			Headers:         amqpgo.Table(m.Properties.Headers),
+			Headers:         castArgumentsToAMQP091Table(m.Properties.Headers),
 			ContentType:     m.Properties.ContentType,
 			ContentEncoding: m.Properties.ContentEncoding,
 			DeliveryMode:    m.Properties.DeliveryMode,
@@ -87,9 +93,12 @@ func (b *AMQP091) handlePackage(ctx context.Context, p *transport.Package) {
 			Type:            m.Properties.Type,
 			UserId:          m.Properties.UserId,
 			AppId:           m.Properties.AppId,
-			Body:            m.Body,
+			Body:            body,
 		})
 		if err != nil {
+			b.logger.Error("Failed to publish message",
+				slog.String("sid", p.Session.SID().String()),
+				slog.Any("error", err))
 			p.Session.Reply(&transport.Package{Message: &transport.ReplyError{Err: err}})
 		}
 		// TODO: ListenPublish and match with DeliveryTag confirmed to make sure no undelivered closure of the router happen
@@ -138,4 +147,27 @@ func (b *AMQP091) Close() error {
 
 type AMQP091Config struct {
 	DSN string
+}
+
+func castArgumentsToAMQP091Table(in transport.Arguments) amqpgo.Table {
+	out := make(amqpgo.Table, len(in))
+	for k, v := range in {
+		switch val := v.(type) {
+		case transport.Arguments:
+			out[k] = castArgumentsToAMQP091Table(val)
+		case []interface{}:
+			arr := make([]interface{}, len(val))
+			for i, item := range val {
+				if subMap, ok := item.(transport.Arguments); ok {
+					arr[i] = castArgumentsToAMQP091Table(subMap)
+				} else {
+					arr[i] = item
+				}
+			}
+			out[k] = arr
+		default:
+			out[k] = v
+		}
+	}
+	return out
 }

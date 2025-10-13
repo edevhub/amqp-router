@@ -1,6 +1,9 @@
 package transport
 
-import "time"
+import (
+	"bytes"
+	"time"
+)
 
 type ReplyCode int
 
@@ -79,5 +82,5 @@ type BasicPublish struct {
 	Mandatory  bool
 	Immediate  bool
 	Properties DeliveryProps
-	Body       []byte
+	Body       *bytes.Buffer
 }

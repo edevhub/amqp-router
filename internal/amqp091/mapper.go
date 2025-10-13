@@ -1,9 +1,11 @@
 package amqp091
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/edevhub/amqp-router/internal/transport"
 	"github.com/google/uuid"
@@ -31,9 +33,16 @@ func (m *Mapper) MapFrame(f frame, emit chan<- *transport.Package) error {
 	switch fr := f.(type) {
 	case *heartbeatFrame:
 		// TODO: handle heartbeat
+		m.logger.Debug("Received heartbeat frame", slog.Any("frame", fr))
 		return nil
 	case *methodFrame:
 		return m.handleMethod(fr, emit)
+	case *headerFrame:
+		return m.handleHeader(fr)
+	case *bodyFrame:
+		return m.handleBody(fr, emit)
+	default:
+		m.logger.Error("Unsupported frame type", slog.Any("frame", f), slog.String(fmt.Sprintf("%T", f), fmt.Sprintf("%T", f)))
 	}
 	return nil
 }
@@ -64,6 +73,10 @@ func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) er
 		if err != nil {
 			return err
 		}
+		args, err := castArguments(method.Arguments)
+		if err != nil {
+			return err
+		}
 		emit <- &transport.Package{Session: sess, Message: &transport.DeclareExchange{
 			Name:       method.Exchange,
 			Type:       method.Type,
@@ -71,11 +84,15 @@ func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) er
 			AutoDelete: method.AutoDelete,
 			Internal:   method.Internal,
 			NoWait:     method.NoWait,
-			Arguments:  transport.Arguments(method.Arguments),
+			Arguments:  args,
 		}}
 		return nil
 	case *queueDeclare:
 		sess, err := m.findSession(f.channel())
+		if err != nil {
+			return err
+		}
+		args, err := castArguments(method.Arguments)
 		if err != nil {
 			return err
 		}
@@ -86,11 +103,15 @@ func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) er
 			Exclusive:  method.Exclusive,
 			AutoDelete: method.AutoDelete,
 			NoWait:     method.NoWait,
-			Arguments:  transport.Arguments(method.Arguments),
+			Arguments:  args,
 		}}
 		return nil
 	case *queueBind:
 		sess, err := m.findSession(f.channel())
+		if err != nil {
+			return err
+		}
+		args, err := castArguments(method.Arguments)
 		if err != nil {
 			return err
 		}
@@ -99,7 +120,7 @@ func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) er
 			Exchange:   method.Exchange,
 			RoutingKey: method.RoutingKey,
 			NoWait:     method.NoWait,
-			Arguments:  transport.Arguments(method.Arguments),
+			Arguments:  args,
 		}}
 		return nil
 	case *basicPublish:
@@ -107,33 +128,65 @@ func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) er
 		if err != nil {
 			return err
 		}
-		// TODO: debug why messages are received and mapped empty
-		emit <- &transport.Package{Session: sess, Message: &transport.BasicPublish{
+		if err = sess.StartPublishing(&transport.BasicPublish{
 			Exchange:   method.Exchange,
 			RoutingKey: method.RoutingKey,
 			Mandatory:  method.Mandatory,
 			Immediate:  method.Immediate,
-			Properties: transport.DeliveryProps{
-				ContentType:     method.Properties.ContentType,
-				ContentEncoding: method.Properties.ContentEncoding,
-				Headers:         transport.Arguments(method.Properties.Headers),
-				DeliveryMode:    method.Properties.DeliveryMode,
-				Priority:        method.Properties.Priority,
-				CorrelationId:   method.Properties.CorrelationId,
-				ReplyTo:         method.Properties.ReplyTo,
-				Expiration:      method.Properties.Expiration,
-				MessageId:       method.Properties.MessageId,
-				Timestamp:       method.Properties.Timestamp,
-				Type:            method.Properties.Type,
-				UserId:          method.Properties.UserId,
-				AppId:           method.Properties.AppId,
-			},
-			Body: method.Body,
-		}}
+			Body:       bytes.NewBuffer(nil),
+		}); err != nil {
+			return err
+		}
 		return nil
 	default:
 		return fmt.Errorf("unsupported method: %T", method)
 	}
+}
+
+func (m *Mapper) handleHeader(f *headerFrame) error {
+	sess, err := m.findSession(f.channel())
+	if err != nil {
+		return err
+	}
+	pc := sess.PublishCollector()
+	if pc == nil {
+		return fmt.Errorf("no message collected for publishing at channel: %d (%s)", f.channel(), sess.SID().String())
+	}
+	pc.Size = f.Size
+	headers, err := castArguments(f.Properties.Headers)
+	pc.Message().Properties = transport.DeliveryProps{
+		ContentType:     f.Properties.ContentType,
+		ContentEncoding: f.Properties.ContentEncoding,
+		Headers:         headers,
+		DeliveryMode:    f.Properties.DeliveryMode,
+		Priority:        f.Properties.Priority,
+		CorrelationId:   f.Properties.CorrelationId,
+		ReplyTo:         f.Properties.ReplyTo,
+		Expiration:      f.Properties.Expiration,
+		MessageId:       f.Properties.MessageId,
+		Timestamp:       f.Properties.Timestamp,
+		Type:            f.Properties.Type,
+		UserId:          f.Properties.UserId,
+		AppId:           f.Properties.AppId,
+	}
+	return nil
+}
+
+func (m *Mapper) handleBody(f *bodyFrame, emit chan<- *transport.Package) error {
+	sess, err := m.findSession(f.channel())
+	if err != nil {
+		return err
+	}
+	pc := sess.PublishCollector()
+	if pc == nil {
+		return fmt.Errorf("no message collected for publishing at channel: %d (%s)", f.channel(), sess.SID().String())
+	}
+	pc.Message().Body.Write(f.Body)
+	if uint64(pc.Message().Body.Len()) == pc.Size {
+		emit <- &transport.Package{Session: sess, Message: pc.Message()}
+		sess.FlushPublishing()
+	}
+	return nil
 }
 
 func (m *Mapper) findSession(id uint16) (*transport.Session, error) {
@@ -167,4 +220,40 @@ func (m *Mapper) Cleanup() {
 		m.RecycleSession(sid)
 	}
 	close(m.sessionsNotify)
+}
+
+func castArguments(in Table) (transport.Arguments, error) {
+	out := make(transport.Arguments, len(in))
+	for k, v := range in {
+		switch vt := v.(type) {
+		case nil, bool, byte, int8, int, int16, int32, int64, float32, float64, string, []byte, Decimal, time.Time:
+			out[k] = vt
+		case Table:
+			nested, err := castArguments(vt)
+			if err != nil {
+				return nil, fmt.Errorf("nested table %q: %w", k, err)
+			}
+			out[k] = nested
+		case []interface{}:
+			arr := make([]interface{}, len(vt))
+			for i, elem := range vt {
+				switch et := elem.(type) {
+				case bool, int, int16, int32, int64, float32, float64, string, []byte, time.Time, nil:
+					arr[i] = et
+				case Table:
+					nested, err := castArguments(et)
+					if err != nil {
+						return nil, fmt.Errorf("array[%d] nested table: %w", i, err)
+					}
+					arr[i] = nested
+				default:
+					return nil, fmt.Errorf("unsupported array element type at index %d: %T", i, elem)
+				}
+			}
+			out[k] = arr
+		default:
+			return nil, fmt.Errorf("unsupported argument type: %T", v)
+		}
+	}
+	return out, nil
 }
