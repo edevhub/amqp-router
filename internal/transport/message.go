@@ -13,6 +13,8 @@ const (
 	ReplyCodeQueueDeclareOk
 	ReplyCodeQueueBindOk
 	ReplyCodeBasicAck
+	ReplyCodeBasicConsumeOk
+	ReplyCodeBasicConsumeDelivery
 )
 
 type Reply struct {
@@ -28,6 +30,10 @@ type ReplyConfirmation struct {
 	DeliveryTag uint64
 	Multiple    bool
 	Ack         bool
+}
+
+type ReplyConsume struct {
+	ConsumerTag string
 }
 
 type Arguments map[string]interface{}
@@ -83,4 +89,28 @@ type BasicPublish struct {
 	Immediate  bool
 	Properties DeliveryProps
 	Body       *bytes.Buffer
+}
+
+type Delivery struct {
+	Props DeliveryProps
+
+	ConsumerTag  string
+	MessageCount uint32
+
+	DeliveryTag uint64
+	Redelivered bool
+	Exchange    string // basic.publish exchange
+	RoutingKey  string // basic.publish routing key
+
+	Body []byte
+}
+
+type BasicConsume struct {
+	Queue       string
+	ConsumerTag string
+	NoLocal     bool
+	NoAck       bool
+	Exclusive   bool
+	NoWait      bool
+	Arguments   Arguments
 }

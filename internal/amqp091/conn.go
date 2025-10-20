@@ -274,10 +274,12 @@ func (c *Connection) sendReplyMessage(sess *transport.Session, m *transport.Repl
 		confirm, ok := m.Content.(*transport.ReplyConfirmation)
 		if !ok {
 			c.logger.Error("Unexpected reply content type",
+				slog.String("expected", "ReplyConfirmation"),
 				slog.Int("reply_code", int(m.Code)),
 				slog.String("content_type", fmt.Sprintf("%T", m.Content)),
 				slog.Any("content", m.Content),
 			)
+			return nil
 		}
 		if confirm.Ack {
 			return c.send(&methodFrame{
@@ -293,6 +295,62 @@ func (c *Connection) sendReplyMessage(sess *transport.Session, m *transport.Repl
 			Method: &basicNack{
 				DeliveryTag: confirm.DeliveryTag,
 				Multiple:    confirm.Multiple,
+			},
+		})
+	case transport.ReplyCodeBasicConsumeOk:
+		c.logger.Debug("Sending basic consume ok reply")
+		reply, ok := m.Content.(*transport.ReplyConsume)
+		if !ok {
+			c.logger.Error("Unexpected reply content type",
+				slog.String("expected", "ReplyConsume"),
+				slog.Int("reply_code", int(m.Code)),
+				slog.String("content_type", fmt.Sprintf("%T", m.Content)),
+				slog.Any("content", m.Content),
+			)
+			return nil
+		}
+		return c.send(&methodFrame{
+			ChannelId: sess.ID,
+			Method: &basicConsumeOk{
+				ConsumerTag: reply.ConsumerTag,
+			},
+		})
+	case transport.ReplyCodeBasicConsumeDelivery:
+		c.logger.Debug("Sending basic consume delivered message")
+		d, ok := m.Content.(*transport.Delivery)
+		if !ok {
+			c.logger.Error("Unexpected reply content type",
+				slog.String("expected", "Delivery"),
+				slog.Int("reply_code", int(m.Code)),
+				slog.String("content_type", fmt.Sprintf("%T", m.Content)),
+				slog.Any("content", m.Content),
+			)
+			return nil
+		}
+		return c.send(&methodFrame{
+			ChannelId: sess.ID,
+			Method: &basicDeliver{
+				ConsumerTag: d.ConsumerTag,
+				DeliveryTag: d.DeliveryTag,
+				Redelivered: d.Redelivered,
+				Exchange:    d.Exchange,
+				RoutingKey:  d.RoutingKey,
+				Properties: properties{
+					ContentType:     d.Props.ContentType,
+					ContentEncoding: d.Props.ContentEncoding,
+					Headers:         CastArgumentsToTable[Table](d.Props.Headers),
+					DeliveryMode:    d.Props.DeliveryMode,
+					Priority:        d.Props.Priority,
+					CorrelationId:   d.Props.CorrelationId,
+					ReplyTo:         d.Props.ReplyTo,
+					Expiration:      d.Props.Expiration,
+					MessageId:       d.Props.MessageId,
+					Timestamp:       d.Props.Timestamp,
+					Type:            d.Props.Type,
+					UserId:          d.Props.UserId,
+					AppId:           d.Props.AppId,
+				},
+				Body: d.Body,
 			},
 		})
 	default:

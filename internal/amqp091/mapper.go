@@ -9,6 +9,7 @@ import (
 
 	"github.com/edevhub/amqp-router/internal/transport"
 	"github.com/google/uuid"
+	amqpgo "github.com/rabbitmq/amqp091-go"
 )
 
 type Mapper struct {
@@ -73,7 +74,7 @@ func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) er
 		if err != nil {
 			return err
 		}
-		args, err := castArguments(method.Arguments)
+		args, err := CastTableToArguments(method.Arguments)
 		if err != nil {
 			return err
 		}
@@ -92,7 +93,7 @@ func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) er
 		if err != nil {
 			return err
 		}
-		args, err := castArguments(method.Arguments)
+		args, err := CastTableToArguments(method.Arguments)
 		if err != nil {
 			return err
 		}
@@ -111,7 +112,7 @@ func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) er
 		if err != nil {
 			return err
 		}
-		args, err := castArguments(method.Arguments)
+		args, err := CastTableToArguments(method.Arguments)
 		if err != nil {
 			return err
 		}
@@ -138,6 +139,25 @@ func (m *Mapper) handleMethod(f *methodFrame, emit chan<- *transport.Package) er
 			return err
 		}
 		return nil
+	case *basicConsume:
+		sess, err := m.findSession(f.channel())
+		if err != nil {
+			return err
+		}
+		args, err := CastTableToArguments(method.Arguments)
+		if err != nil {
+			return err
+		}
+		emit <- &transport.Package{Session: sess, Message: &transport.BasicConsume{
+			Queue:       method.Queue,
+			ConsumerTag: method.ConsumerTag,
+			NoAck:       method.NoAck,
+			NoLocal:     method.NoLocal,
+			Exclusive:   method.Exclusive,
+			NoWait:      method.NoWait,
+			Arguments:   args,
+		}}
+		return nil
 	default:
 		return fmt.Errorf("unsupported method: %T", method)
 	}
@@ -153,7 +173,7 @@ func (m *Mapper) handleHeader(f *headerFrame) error {
 		return fmt.Errorf("no message collected for publishing at channel: %d (%s)", f.channel(), sess.SID().String())
 	}
 	pc.Size = f.Size
-	headers, err := castArguments(f.Properties.Headers)
+	headers, err := CastTableToArguments(f.Properties.Headers)
 	pc.Message().Properties = transport.DeliveryProps{
 		ContentType:     f.Properties.ContentType,
 		ContentEncoding: f.Properties.ContentEncoding,
@@ -222,14 +242,20 @@ func (m *Mapper) Cleanup() {
 	close(m.sessionsNotify)
 }
 
-func castArguments(in Table) (transport.Arguments, error) {
+func CastTableToArguments[T Table | amqpgo.Table](in T) (transport.Arguments, error) {
 	out := make(transport.Arguments, len(in))
 	for k, v := range in {
 		switch vt := v.(type) {
 		case nil, bool, byte, int8, int, int16, int32, int64, float32, float64, string, []byte, Decimal, time.Time:
 			out[k] = vt
 		case Table:
-			nested, err := castArguments(vt)
+			nested, err := CastTableToArguments[Table](vt)
+			if err != nil {
+				return nil, fmt.Errorf("nested table %q: %w", k, err)
+			}
+			out[k] = nested
+		case amqpgo.Table:
+			nested, err := CastTableToArguments[amqpgo.Table](vt)
 			if err != nil {
 				return nil, fmt.Errorf("nested table %q: %w", k, err)
 			}
@@ -241,7 +267,13 @@ func castArguments(in Table) (transport.Arguments, error) {
 				case bool, int, int16, int32, int64, float32, float64, string, []byte, time.Time, nil:
 					arr[i] = et
 				case Table:
-					nested, err := castArguments(et)
+					nested, err := CastTableToArguments[Table](et)
+					if err != nil {
+						return nil, fmt.Errorf("array[%d] nested table: %w", i, err)
+					}
+					arr[i] = nested
+				case amqpgo.Table:
+					nested, err := CastTableToArguments[amqpgo.Table](et)
 					if err != nil {
 						return nil, fmt.Errorf("array[%d] nested table: %w", i, err)
 					}
@@ -256,4 +288,27 @@ func castArguments(in Table) (transport.Arguments, error) {
 		}
 	}
 	return out, nil
+}
+
+func CastArgumentsToTable[T Table | amqpgo.Table](in transport.Arguments) T {
+	out := make(T, len(in))
+	for k, v := range in {
+		switch val := v.(type) {
+		case transport.Arguments:
+			out[k] = CastArgumentsToTable[T](val)
+		case []interface{}:
+			arr := make([]interface{}, len(val))
+			for i, item := range val {
+				if subMap, ok := item.(transport.Arguments); ok {
+					arr[i] = CastArgumentsToTable[T](subMap)
+				} else {
+					arr[i] = item
+				}
+			}
+			out[k] = arr
+		default:
+			out[k] = v
+		}
+	}
+	return out
 }
